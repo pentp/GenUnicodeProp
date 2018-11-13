@@ -1,33 +1,179 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace GenUnicodeProp
 {
 	internal sealed class DataTable
 	{
-		private readonly byte TableType;
+		// This contains the data mapping between codepoints and values.
+		private readonly SortedDictionary<uint, byte> RawData = new SortedDictionary<uint, byte>();
+
+		private readonly List<byte> Level1Index = new List<byte>();
+		private readonly List<ushort> Level2Index = new List<ushort>();
+		private bool Level2HasBytes;
+		private readonly List<byte> Level3Data = new List<byte>();
+
+		//   Actions:
+		//       Add the value data for the specified codepoint.
+		//
+		//   Parameters:
+		//        $codepoint    The codepoint to be added
+		//        $value        The value for the specified codepoint
+		public void AddData(uint codepoint, byte value) => RawData[codepoint] = value;
+
+		/// <summary>
+		/// Create the 12:4:4 data table structure after all the codepoint/value pairs are added by using AddData.
+		/// </summary>
+		public void GenerateTable(string name, int level2bits = 4, int level3bits = 4, bool cutOff = false)
+		{
+			Console.WriteLine();
+			var (_, lines) = GenerateTable(level2bits, level3bits, cutOff, name, Level1Index, Level2Index, Level3Data);
+			foreach(var l in lines) Console.WriteLine(l);
+		}
+
+		public void CalculateTableVariants(bool cutOff = false)
+		{
+			foreach(var ((l2, l3), (total, stats)) in (
+				from l2 in Enumerable.Range(1, 7)
+				from l3 in Enumerable.Range(1, 7)
+				select (l2, l3)).AsParallel().Select(l => (l, res: GenerateTable(l.l2, l.l3, cutOff))).OrderBy(v => v.res.Total))
+			{
+				Console.WriteLine($"Stats for {l2}:{l3}");
+				foreach(var line in stats) Console.WriteLine(line);
+			}
+		}
+
+		private (int Total, string[] Stats) GenerateTable(int level2bits, int level3bits, bool cutOff, string name = null, List<byte> level1Index = null, List<ushort> level2Index = null, List<byte> level3Data = null)
+		{
+			if(name != null) Console.WriteLine($"Process {20 - level3bits - level2bits}:{level2bits}:{level3bits} table {name}.");
+
+			var level2Hash = new Dictionary<string, ushort>();
+			var level3Hash = new Dictionary<string, ushort>();
+
+			const int planes = 17;
+			var level1block = planes << (16 - level2bits - level3bits);
+			var level2block = 1 << level2bits;
+			var level3block = 1 << level3bits;
+
+			var level1Count = 0;
+			var level2Count = 0;
+			var level3Count = 0;
+
+			var level3RowData = new byte[level3block];
+			var level2RowData = new ushort[level2block];
+
+			if(cutOff && level1Index == null) level1Index = new List<byte>();
+
+			// Process plan 0 ~ 16.
+			var ch = 0u;
+			for(var i = 0;i < level1block;i++)
+			{
+				// Generate level 1 indice
+
+				// This is the row data which contains a row of indice for level 2 table.
+				for(var j = 0;j < level2RowData.Length;j++)
+				{
+					// Generate level 2 indice
+					for(var k = 0;k < level3RowData.Length;k++)
+					{
+						// Generate level 3 values by grouping 16 values together.
+						RawData.TryGetValue(ch, out var value);
+						level3RowData[k] = value;
+						ch++;
+					}
+
+					// Check if the pattern of these 16 values happens before.
+					var level3key = string.Join(";", level3RowData);
+					if(!level3Hash.TryGetValue(level3key, out var valueInHash3))
+					{
+						// This is a new group in the level 3 values.
+						// Get the current count of level 3 group count for this plane.
+						valueInHash3 = checked((ushort)level3Count);
+						// Store this count to the hash table, keyed by the pattern of these 16 values.
+						level3Hash[level3key] = valueInHash3;
+
+						// Populate the 16 values into level 3 data table for this plane.
+						level3Data?.AddRange(level3RowData);
+						level3Count++;
+					}
+					level2RowData[j] = valueInHash3;
+				}
+
+				var level2key = string.Join(";", level2RowData);
+				if(!level2Hash.TryGetValue(level2key, out var valueInHash))
+				{
+					// Get the count of the current level 2 index table.
+					valueInHash = checked((ushort)level2Count);
+					level2Hash[level2key] = valueInHash;
+
+					// Populate the 16 values into level 2 data table for this plane.
+					level2Index?.AddRange(level2RowData);
+					level2Count++;
+				}
+				// Populate the index values into level 1 index table.
+				level1Index?.Add(checked((byte)valueInHash));
+				level1Count++;
+			}
+
+			if(cutOff)
+			{
+				Array.Fill(level3RowData, default);
+				if(level3Hash.TryGetValue(string.Join(";", level3RowData), out var index))
+				{
+					Array.Fill(level2RowData, index);
+					if(level2Hash.TryGetValue(string.Join(";", level2RowData), out index))
+					{
+						while(level1Index.Count > 0 && level1Index[level1Index.Count - 1] == index)
+						{
+							level1Index.RemoveAt(level1Index.Count - 1);
+							level1Count--;
+						}
+					}
+				}
+			}
+
+			var level1uint = level2Hash.Count < 256 ? 1 : 2;
+			var level2uint = level3Hash.Count < 256 ? 1 : 2;
+
+			if(level2Index != null) Level2HasBytes = level2uint == 1;
+
+			var stats = new string[4];
+			stats[0] = $"level 1: {level1Count,4} [{level1Count *= level1uint,5}]{(level1uint > 1 ? "*" : null)}";
+			stats[1] = $"level 2: {level2Count,4} [{level2Count *= level2uint * level2block,5}]{(level2uint > 1 ? "*" : null)}";
+			stats[2] = $"level 3: {level3Count,4} [{level3Count *= level3block,5}]";
+
+			var total = level1Count + level2Count + level3Count;
+			stats[3] = $"Total:         {total,5}";
+			return (total, stats);
+		}
+
+		public byte[][] GetBytes()
+		{
+			var level2 = new List<byte>();
+			for(var i = 0;i < Level2Index.Count;i++)
+			{
+				if(Level2HasBytes) level2.Add(checked((byte)Level2Index[i]));
+				else level2.AddRange(BitConverter.GetBytes(Level2Index[i]));
+			}
+
+			return new[] { Level1Index.ToArray(), level2.ToArray(), Level3Data.ToArray() };
+		}
+	}
+
+	internal sealed class FlatDataTable
+	{
 		private readonly string DefaultValue;
-		private readonly byte ValueByteSize;
 		private readonly Func<string, byte[]> GetValueBytesCallback;
 
 		// This contains the data mapping between codepoints and values.
 		private readonly SortedDictionary<uint, string> RawData = new SortedDictionary<uint, string>();
 
-		// The following are all 2-dimentional array.  
-		// The first dimention is the plane, and the second dimention is the index or values for that plane.
-		private readonly List<byte> Level1Index = new List<byte>();
-		private readonly List<ushort> Level2Index = new List<ushort>();
-		private readonly List<string> Level3Data = new List<string>();
-
-		public DataTable(byte tableType, string defaultValue, byte valueByteSize, Func<string, byte[]> getValueBytesCallback)
+		public FlatDataTable(string defaultValue, Func<string, byte[]> getValueBytesCallback)
 		{
-			if(tableType != 1 && tableType != 12) throw new ArgumentException($"Invalid table type [{tableType}].");
-			TableType = tableType;
-
 			// If a codepoint does not have data, this specifies the default value.    
 			DefaultValue = defaultValue;
 
-			ValueByteSize = valueByteSize;
 			GetValueBytesCallback = getValueBytesCallback;
 		}
 
@@ -39,141 +185,12 @@ namespace GenUnicodeProp
 		//        $value        The value for the specified codepoint
 		public void AddData(uint codepoint, string value) => RawData[codepoint] = value;
 
-		public void AddData(uint key, byte value) => AddData(key, value.ToString());
-
 		public byte[] GetBytesFlat()
 		{
 			var str = new List<byte>();
 			foreach(var v in RawData.Values)
 				str.AddRange(GetValueBytesCallback(v ?? DefaultValue));
 			return str.ToArray();
-		}
-
-		/// <summary>
-		/// Create the 12:4:4 data table structure after all the codepoint/value pairs are added by using AddData.
-		/// </summary>
-		public void GenerateTable12_4_4()
-		{
-			if(TableType != 12) throw new InvalidOperationException("Invalid table type. The value should be 12.");
-			Console.WriteLine("Process 12:4:4 table.");
-
-			var ch = 0u;
-
-			// There is data in the plane.  Create 8:4:4 table for this plane.
-			var level2Hash = new Dictionary<string, byte>();
-			var level3Hash = new Dictionary<string, ushort>();
-
-			const int planes = 17;
-			const int level2block = 16;
-			const int level3block = 16;
-
-			var level3RowData = new string[level3block];
-			var level2RowData = new ushort[level2block];
-
-			// Process plan 0 ~ 16.
-			for(var i = 0;i < 256 * planes;i++)
-			{
-				// Generate level 1 indice
-
-				// This is the row data which contains a row of indice for level 2 table.
-				for(var j = 0;j < level2RowData.Length;j++)
-				{
-					// Generate level 2 indice
-					for(var k = 0;k < level3RowData.Length;k++)
-					{
-						// Generate level 3 values by grouping 16 values together.
-						// Each element of the 16 value group is seperated by ";"
-						if(!RawData.TryGetValue(ch, out var value)) value = DefaultValue;
-
-						level3RowData[k] = value;
-						ch++;
-					}
-
-					// Check if the pattern of these 16 values happens before.
-					var level3key = string.Join(";", level3RowData);
-					if(!level3Hash.TryGetValue(level3key, out var valueInHash3))
-					{
-						// This is a new group in the level 3 values.
-						// Get the current count of level 3 group count for this plane.
-						valueInHash3 = checked((ushort)Level3Data.Count);
-						// Store this count to the hash table, keyed by the pattern of these 16 values.
-						level3Hash[level3key] = valueInHash3;
-
-						// Populate the 16 values into level 3 data table for this plane.
-						Level3Data.AddRange(level3RowData);
-					}
-					level2RowData[j] = valueInHash3;
-				}
-
-				var level2key = string.Join(";", level2RowData);
-				if(!level2Hash.TryGetValue(level2key, out var valueInHash))
-				{
-					// Get the count of the current level 2 index table.
-					valueInHash = checked((byte)(Level2Index.Count / level3block));
-					level2Hash[level2key] = valueInHash;
-
-					// Populate the 16 values into level 2 data table for this plane.
-					Level2Index.AddRange(level2RowData);
-				}
-				// Populate the index values into level 1 index table.
-				Level1Index.Add(valueInHash);
-			}
-
-			var level1Count = Level1Index.Count;
-			var level2Count = Level2Index.Count;
-			var level3Count = Level3Data.Count;
-
-			Console.WriteLine($"level 1: {level1Count}");
-			Console.WriteLine($"level 2: {level2Count}");
-			Console.WriteLine($"level 3: {level3Count}");
-
-			var planeTableSize
-					= level1Count * 1 +    // Level 1 index value is BYTE.
-						level2Count * 2 +    // Level 2 index value is WORD.
-						level3Count * ValueByteSize;
-			Console.WriteLine(planeTableSize);
-		}
-
-		public byte[][] GetBytes12_4_4()
-		{
-			// Write level 1 table
-			// An item in level 1 table in WORD.
-			var level1 = new List<byte>();
-			for(var i = 0;i < Level1Index.Count;i++)
-				level1.AddRange(BitConverter.GetBytes((ushort)(Level1Index[i] * 16 + Level1Index.Count)));
-
-			// Write level 2 table
-			// An item in level 2 table in WORD.
-			var level2 = new List<byte>();
-			for(var i = 0;i < Level2Index.Count;i++)
-			{
-				// The index is based on WORD array.  Therefore, we have to adjust the index value based on the byte size of the final value.
-				// byte value => divide by 2
-				// word value -> divide by one
-				// dword value -> multiply by 2.
-				level2.AddRange(BitConverter.GetBytes((ushort)(Level2Index[i] * ValueByteSize / 2 + Level1Index.Count + Level2Index.Count)));
-			}
-
-			// Write level 3 values by calling the callback functions.
-			var level3 = new List<byte>();
-			for(var i = 0;i < Level3Data.Count;i++)
-			{
-				// Call the callback function to get the bytes of the value.
-				level3.AddRange(GetValueBytesCallback(Level3Data[i]));
-			}
-			level3.AddRange(GetByteBoundaryBytes(16, level1.Count + level2.Count + level3.Count - 4/*-4 is a BUG in original script*/, 0xEE));
-
-			return new[] { level1.ToArray(), level2.ToArray(), level3.ToArray() };
-		}
-
-		private static byte[] GetByteBoundaryBytes(int byteBoundary, int offset, byte byteToFill)
-		{
-			var remainder = offset % byteBoundary;
-			if(remainder == 0) return Array.Empty<byte>();
-
-			var res = new byte[byteBoundary - remainder];
-			Array.Fill(res, byteToFill);
-			return res;
 		}
 	}
 }
